@@ -1,0 +1,35 @@
+# Build directories
+build/
+out/
+bin/
+obj/
+
+# IDE files
+.vs/
+.vscode/
+*.swp
+*.swo
+*.user
+*.suo
+*.sln
+*.vcxproj
+*.filters
+
+# Environment and Secrets
+.env
+!.env.example
+
+# Temporary processing files
+temp_*/
+*.tmp
+*.log
+
+# Dependencies (if any are local)
+# _deps/ is inside build/, so it's already covered, but explicit is better
+_deps/
+
+# OS generated files
+Thumbs.db
+Desktop.ini
+.DS_Store
+GEMINI.md
