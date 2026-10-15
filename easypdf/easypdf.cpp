@@ -1,4 +1,7 @@
 #include "easypdf.h"
+#include <array>
+#include <condition_variable>
+#include <deque>
 
 using namespace easypdf;
 using namespace std;
@@ -7,11 +10,25 @@ using namespace std;
 struct UserState {
     string filePath;
     string originalName;
-    int64_t lastMenuMessageId;
+    int64_t lastMenuMessageId = 0;
 };
 
 map<int64_t, UserState> sessions;
 mutex stateMtx;
+
+struct UpdateQueue {
+    mutex mtx;
+    condition_variable ready;
+    condition_variable space;
+    deque<json> updates;
+};
+
+int64_t updateChatId(const json& update) {
+    if (update.contains("message")) return update["message"]["chat"].value("id", int64_t{0});
+    if (update.contains("callback_query") && update["callback_query"].contains("message"))
+        return update["callback_query"]["message"]["chat"].value("id", int64_t{0});
+    return 0;
+}
 
 void handleUpdate(TelegramClient& client, const json& update) {
     if (update.contains("message")) {
@@ -40,34 +57,54 @@ void handleUpdate(TelegramClient& client, const json& update) {
                 auto& doc = message["document"];
                 fileId = doc["file_id"];
                 rawName = doc.contains("file_name") ? doc["file_name"].get<string>() : "documento.bin";
-                fileSize = doc["file_size"];
+                fileSize = doc.value("file_size", uintmax_t{0});
             } else {
                 // Es una foto (Telegram envía varias resoluciones, tomamos la mayor)
                 auto& photos = message["photo"];
                 auto& best = photos.back();
                 fileId = best["file_id"];
-                fileSize = best["file_size"];
+                fileSize = best.value("file_size", uintmax_t{0});
                 rawName = "imagen_" + to_string(messageId) + ".jpg";
             }
 
             string cleanName = FileUtils::sanitizeName(rawName);
+            string ext = fs::path(cleanName).extension().string();
+            transform(ext.begin(), ext.end(), ext.begin(), [](unsigned char c) { return static_cast<char>(tolower(c)); });
+            if (ext != ".pdf" && ext != ".txt" && ext != ".docx" && ext != ".doc" &&
+                ext != ".rtf" && ext != ".jpg" && ext != ".jpeg" && ext != ".png") {
+                client.sendMessage(chatId, "Formato no compatible.");
+                return;
+            }
+            constexpr uintmax_t maxFileSize = 20 * 1024 * 1024;
+            if (fileSize > maxFileSize) {
+                client.sendMessage(chatId, "El archivo supera el límite de 20 MB.");
+                return;
+            }
             string userDir = "temp_" + to_string(chatId);
             fs::create_directories(userDir);
             string tempPath = userDir + "/" + cleanName;
 
-            if (client.downloadFile(fileId, tempPath) != "") {
+            {
                 lock_guard<mutex> lock(stateMtx);
-                sessions[chatId] = {tempPath, cleanName, 0};
+                auto previous = sessions.find(chatId);
+                if (previous != sessions.end()) {
+                    fs::remove(previous->second.filePath);
+                    sessions.erase(previous);
+                }
+            }
 
+            if (client.downloadFile(fileId, tempPath) != "") {
+                if (fs::file_size(tempPath) > maxFileSize) {
+                    fs::remove(tempPath);
+                    client.sendMessage(chatId, "El archivo supera el límite de 20 MB.");
+                    return;
+                }
                 string info = "<b>📥 Archivo Recibido</b>\n"
-                              "📂 <code>" + cleanName + "</code>\n"
+                              "📂 <code>" + FileUtils::escapeHtml(cleanName) + "</code>\n"
                               "⚖️ <code>" + FileUtils::formatSize(fileSize) + "</code>\n\n"
                               "¿Qué acción deseas ejecutar?";
 
                 json keyboard;
-                string ext = fs::path(cleanName).extension().string();
-                std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
-
                 if (ext == ".pdf") {
                     keyboard = {{"inline_keyboard", {
                         {{{"text", "📝 Convertir a Word"}, {"callback_data", "to_word"}}},
@@ -80,7 +117,15 @@ void handleUpdate(TelegramClient& client, const json& update) {
                     }}};
                 }
 
-                client.sendMessageWithButtons(chatId, info, keyboard);
+                int64_t menuId = client.sendMessageWithButtons(chatId, info, keyboard);
+                if (menuId != 0) {
+                    lock_guard<mutex> lock(stateMtx);
+                    sessions[chatId] = {tempPath, cleanName, menuId};
+                }
+                else fs::remove(tempPath);
+            } else {
+                fs::remove(tempPath);
+                client.sendMessage(chatId, "No se pudo descargar el archivo.");
             }
         }
     } else if (update.contains("callback_query")) {
@@ -98,9 +143,8 @@ void handleUpdate(TelegramClient& client, const json& update) {
             }
         }
 
-        if (state.filePath.empty()) {
+        if (state.filePath.empty() || state.lastMenuMessageId != msgId) {
             client.answerCallbackQuery(cbId, "⚠️ Sesión expirada o archivo no encontrado.");
-            client.deleteMessage(chatId, msgId);
             return;
         }
 
@@ -111,7 +155,8 @@ void handleUpdate(TelegramClient& client, const json& update) {
             string pdfPath = FileProcessor::convertToPdf(state.filePath);
             
             if (!pdfPath.empty()) {
-                client.sendDocument(chatId, pdfPath, "✅ <b>¡Listo!</b> Aquí tienes tu PDF.");
+                if (!client.sendDocument(chatId, pdfPath, "✅ <b>¡Listo!</b> Aquí tienes tu PDF."))
+                    client.sendMessage(chatId, "No se pudo enviar el PDF. Inténtalo de nuevo.");
                 fs::remove(pdfPath);
             } else {
                 client.sendMessage(chatId, "❌ <b>Error:</b> No se pudo convertir este archivo.");
@@ -123,10 +168,8 @@ void handleUpdate(TelegramClient& client, const json& update) {
             string docxPath = FileProcessor::convertPdfToDocx(state.filePath);
             
             if (!docxPath.empty()) {
-                // Reutilizamos sendDocument pero Telegram lo tratará como docx por la extensión
-                // Sin embargo, nuestro sendDocument tiene application/pdf hardcoded.
-                // Deberíamos hacerlo dinámico o crear sendGenericDocument.
-                client.sendDocument(chatId, docxPath, "✅ <b>¡Listo!</b> Aquí tienes tu documento Word.");
+                if (!client.sendDocument(chatId, docxPath, "✅ <b>¡Listo!</b> Aquí tienes tu documento Word."))
+                    client.sendMessage(chatId, "No se pudo enviar el documento. Inténtalo de nuevo.");
                 fs::remove(docxPath);
             } else {
                 client.sendMessage(chatId, "❌ <b>Error:</b> No se pudo convertir el PDF a Word.");
@@ -138,8 +181,7 @@ void handleUpdate(TelegramClient& client, const json& update) {
         // Limpieza final
         {
             lock_guard<mutex> lock(stateMtx);
-            if (fs::exists(state.filePath)) fs::remove(state.filePath);
-            fs::remove_all(fs::path(state.filePath).parent_path()); // Borrar carpeta del usuario
+            fs::remove_all(fs::path(state.filePath).parent_path());
             sessions.erase(chatId);
         }
         client.deleteMessage(chatId, msgId);
@@ -155,6 +197,27 @@ int main() {
 
     TelegramClient client(token);
     int64_t lastUpdateId = 0;
+    constexpr size_t workerCount = 4;
+    constexpr size_t queueCapacity = 64;
+    array<UpdateQueue, workerCount> queues;
+    vector<jthread> workers;
+    for (size_t i = 0; i < workerCount; ++i) {
+        workers.emplace_back([&client, &queues, i]() {
+            auto& queue = queues[i];
+            while (true) {
+                json update;
+                {
+                    unique_lock<mutex> lock(queue.mtx);
+                    queue.ready.wait(lock, [&queue] { return !queue.updates.empty(); });
+                    update = std::move(queue.updates.front());
+                    queue.updates.pop_front();
+                    queue.space.notify_one();
+                }
+                try { handleUpdate(client, update); }
+                catch (const exception& e) { cerr << "Update error: " << e.what() << endl; }
+            }
+        });
+    }
 
     cout << "--- EasyPDF Elite Engine Started ---" << endl;
 
@@ -164,9 +227,12 @@ int main() {
             if (updates != nullptr && updates["ok"]) {
                 for (auto& update : updates["result"]) {
                     lastUpdateId = update["update_id"];
-                    std::jthread([&client, update]() {
-                        handleUpdate(client, update);
-                    }).detach();
+                    size_t shard = static_cast<uint64_t>(updateChatId(update)) % workerCount;
+                    auto& queue = queues[shard];
+                    unique_lock<mutex> lock(queue.mtx);
+                    queue.space.wait(lock, [&queue] { return queue.updates.size() < queueCapacity; });
+                    queue.updates.push_back(update);
+                    queue.ready.notify_one();
                 }
             }
         } catch (const exception& e) {

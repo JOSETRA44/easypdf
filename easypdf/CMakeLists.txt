@@ -11,4 +11,6 @@ target_include_directories(easypdf PRIVATE
 )
 
 # Copiar el archivo .env al directorio de salida si existe
-configure_file("${CMAKE_SOURCE_DIR}/.env" "${CMAKE_CURRENT_BINARY_DIR}/.env" COPYONLY)
+if(EXISTS "${CMAKE_SOURCE_DIR}/.env")
+    configure_file("${CMAKE_SOURCE_DIR}/.env" "${CMAKE_CURRENT_BINARY_DIR}/.env" COPYONLY)
+endif()
