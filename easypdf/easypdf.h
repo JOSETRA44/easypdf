@@ -12,6 +12,8 @@
 #include <map>
 #include <regex>
 #include <algorithm>
+#include <cctype>
+#include <cstdlib>
 
 #include <cpr/cpr.h>
 #include <nlohmann/json.hpp>
@@ -47,8 +49,6 @@ public:
                     if (currentKey == key) {
                         return line.substr(delimiterPos + 1);
                     }
-                } else if (key == "TELEGRAM_BOT_TOKEN" && line.find(':') != std::string::npos && line.find(' ') == std::string::npos) {
-                    return line;
                 }
             }
         }
@@ -65,9 +65,10 @@ public:
 
     json getUpdates(int64_t offset = 0) {
         auto response = cpr::Get(cpr::Url{apiUrl() + "/getUpdates"},
-                                 cpr::Parameters{{"offset", std::to_string(offset)}, {"timeout", "30"}});
+                                 cpr::Parameters{{"offset", std::to_string(offset)}, {"timeout", "30"}},
+                                 cpr::Timeout{40000});
         if (response.status_code != 200) return nullptr;
-        return json::parse(response.text);
+        return json::parse(response.text, nullptr, false);
     }
 
     void sendMessage(int64_t chatId, const std::string& text, const std::string& parseMode = "HTML") {
@@ -77,12 +78,16 @@ public:
                                {"parse_mode", parseMode}});
     }
 
-    void sendMessageWithButtons(int64_t chatId, const std::string& text, const json& keyboard, const std::string& parseMode = "HTML") {
-        cpr::Post(cpr::Url{apiUrl() + "/sendMessage"},
+    int64_t sendMessageWithButtons(int64_t chatId, const std::string& text, const json& keyboard, const std::string& parseMode = "HTML") {
+        auto response = cpr::Post(cpr::Url{apiUrl() + "/sendMessage"},
                   cpr::Payload{{"chat_id", std::to_string(chatId)}, 
                                {"text", text}, 
                                {"parse_mode", parseMode},
                                {"reply_markup", keyboard.dump()}});
+        if (response.status_code != 200) return 0;
+        auto result = json::parse(response.text, nullptr, false);
+        if (result.is_discarded() || !result.value("ok", false)) return 0;
+        return result["result"].value("message_id", int64_t{0});
     }
 
     void answerCallbackQuery(const std::string& callbackQueryId, const std::string& text = "") {
@@ -90,7 +95,7 @@ public:
                   cpr::Payload{{"callback_query_id", callbackQueryId}, {"text", text}});
     }
 
-    void sendDocument(int64_t chatId, const std::string& filePath, const std::string& caption = "", const std::string& parseMode = "HTML") {
+    bool sendDocument(int64_t chatId, const std::string& filePath, const std::string& caption = "", const std::string& parseMode = "HTML") {
         fs::path p(filePath);
         std::string ext = p.extension().string();
         std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
@@ -100,11 +105,14 @@ public:
         else if (ext == ".docx") mimeType = "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
         else if (ext == ".doc") mimeType = "application/msword";
 
-        cpr::Post(cpr::Url{apiUrl() + "/sendDocument"},
+        auto response = cpr::Post(cpr::Url{apiUrl() + "/sendDocument"},
                   cpr::Multipart{{"chat_id", std::to_string(chatId)},
                                  {"document", cpr::File{filePath, p.filename().string()}, mimeType},
                                  {"caption", caption},
                                  {"parse_mode", parseMode}});
+        if (response.status_code != 200) return false;
+        auto result = json::parse(response.text, nullptr, false);
+        return !result.is_discarded() && result.value("ok", false);
     }
 
     void deleteMessage(int64_t chatId, int64_t messageId) {
@@ -124,11 +132,14 @@ public:
         std::string downloadUrl = "https://api.telegram.org/file/bot" + token_ + "/" + filePath;
 
         std::ofstream file(destPath, std::ios::binary);
-        auto downloadResponse = cpr::Get(cpr::Url{downloadUrl});
+        auto downloadResponse = cpr::Get(cpr::Url{downloadUrl}, cpr::Timeout{60000});
         if (downloadResponse.status_code == 200) {
             file << downloadResponse.text;
+            if (!file) return "";
             return destPath;
         }
+        file.close();
+        fs::remove(destPath);
         return "";
     }
 
@@ -142,9 +153,23 @@ private:
  */
 class FileUtils {
 public:
+    static std::string escapeHtml(const std::string& value) {
+        std::string escaped;
+        for (char ch : value) {
+            switch (ch) {
+                case '&': escaped += "&amp;"; break;
+                case '<': escaped += "&lt;"; break;
+                case '>': escaped += "&gt;"; break;
+                case '"': escaped += "&quot;"; break;
+                default: escaped += ch;
+            }
+        }
+        return escaped;
+    }
+
     static std::string sanitizeName(std::string name) {
         // Eliminar caracteres ilegales, peligrosos y comillas
-        std::regex illegal_chars("[<>:\"/\\\\|?*'']");
+        std::regex illegal_chars("[<>:\"/\\\\|?*'%!^]");
         name = std::regex_replace(name, illegal_chars, "_");
         
         // Reemplazar espacios múltiples por uno solo
@@ -157,6 +182,8 @@ public:
             std::string ext = (ext_pos != std::string::npos) ? name.substr(ext_pos) : "";
             name = name.substr(0, 45) + ext;
         }
+        while (!name.empty() && (name.back() == '.' || name.back() == ' ')) name.pop_back();
+        if (name.empty() || name == "." || name == "..") return "archivo.bin";
         return name;
     }
 
@@ -179,6 +206,14 @@ public:
  */
 class FileProcessor {
 public:
+    static std::string powershellQuote(const std::string& value) {
+        std::string quoted = "'";
+        for (char ch : value) {
+            if (ch == '\'') quoted += "''";
+            else quoted += ch;
+        }
+        return quoted + "'";
+    }
     static std::string convertToPdf(const std::string& inputPath) {
         fs::path p(inputPath);
         std::string ext = p.extension().string();
@@ -205,7 +240,7 @@ public:
         std::string absOutput = fs::absolute(docxPath).string();
 
         // Usar Word COM para abrir PDF y guardar como Docx (Word 2013+ soporta esto nativamente)
-        std::string cmd = "powershell -NoProfile -Command \"$word = New-Object -ComObject Word.Application; $word.Visible = $false; try { $doc = $word.Documents.Open('" + absInput + "'); $doc.SaveAs([ref]'" + absOutput + "', [ref]16); $doc.Close(); } finally { $word.Quit(); }\"";
+        std::string cmd = "powershell -NoProfile -Command \"$word = New-Object -ComObject Word.Application; $word.Visible = $false; try { $doc = $word.Documents.Open(" + powershellQuote(absInput) + "); try { $doc.SaveAs([ref]" + powershellQuote(absOutput) + ", [ref]16); } finally { $doc.Close(); } } finally { $word.Quit(); }\"";
 
         int res = std::system(cmd.c_str());
         if (res == 0 && fs::exists(docxPath)) {
@@ -280,7 +315,7 @@ private:
         std::string absInput = fs::absolute(inputPath).string();
         std::string absOutput = fs::absolute(pdfPath).string();
         
-        std::string cmd = "powershell -NoProfile -Command \"$word = New-Object -ComObject Word.Application; $word.Visible = $false; $doc = $word.Documents.Open('" + absInput + "'); $doc.SaveAs([ref]'" + absOutput + "', [ref]17); $doc.Close(); $word.Quit();\"";
+        std::string cmd = "powershell -NoProfile -Command \"$word = New-Object -ComObject Word.Application; $word.Visible = $false; try { $doc = $word.Documents.Open(" + powershellQuote(absInput) + "); try { $doc.SaveAs([ref]" + powershellQuote(absOutput) + ", [ref]17); } finally { $doc.Close(); } } finally { $word.Quit(); }\"";
         
         int res = std::system(cmd.c_str());
         if (res == 0 && fs::exists(pdfPath)) {
